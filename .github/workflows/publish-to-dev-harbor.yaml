@@ -1,5 +1,5 @@
 ### Универсальный модуль публикации проектов на DEV
-# Принимает на вход название команды и JSON с информацией о проектах для деплоя. 
+# Принимает на вход название команды и JSON с информацией о проектах для деплоя.
 
 name: Publish to dev projects base module
 
@@ -8,7 +8,7 @@ on:
     inputs:
       team:
         description: 'team'
-        required: true 
+        required: true
         type: string
       projects:
         description: "JSON объект со списком проектов для публикации"
@@ -22,7 +22,7 @@ on:
       runner:
         description: "Указывает какой раннер будет использоваться для запуска флоу"
         required: false
-        default: sravni_infra_build_small
+        default: "sravni_infra_build_small"
         type: string
       k6:
         description: "Включает нагрузочные тесты k6 после релиза "
@@ -33,14 +33,25 @@ on:
         required: false
         default: true
         type: boolean
-    secrets: 
+      repo_url:
+        required: false
+        default: ''
+        type: string
+    secrets:
       TEST_CI_PAT_FOR_ACTIONS:
+        required: true
+      HARBOR_REGISTRY:
+        required: true
+      HARBOR_LOGIN:
+        required: true
+      HARBOR_PASSWORD:
         required: true
 
 env:
   TEAM: ${{ inputs.team }}
   DELETE_BRANCHES: ${{ inputs.delete_branches }}
-  K6: ${{ inputs.k6}}
+  K6: ${{ inputs.k6 }}
+  REPO_URL: ${{ inputs.repo_url }}
 
 jobs:
   get_branch_name:
@@ -60,13 +71,13 @@ jobs:
         run: |
           branch=$(echo ${GITHUB_HEAD_REF##*/})
           echo "BRANCH=${branch,,}" >> $GITHUB_ENV
-      
+
       - name: Output
         id: out
         run: |
           echo "branch=${{ env.BRANCH }}" >> $GITHUB_OUTPUT
 
-  vars: 
+  vars:
     name: Setup variables
     runs-on: ${{ inputs.runner }}
     outputs:
@@ -85,6 +96,10 @@ jobs:
       TEAM: ${{ needs.vars.outputs.team }}
       REPO_PATH: './deploy/${{ needs.vars.outputs.team }}'
       YQ_VERSION: '4.30.3'
+      SCAN_TOKEN: ${{ secrets.VSK_TOKEN }}
+      API_URL_DEPLOY_IN: https://89.169.173.82:19445/api/vizhn
+      API_URL_DEPLOY_OUT: https://vizhn.sravni.local/api/vizhn
+      REPO_NAME: ${GITHUB_REPOSITORY#$GITHUB_REPOSITORY_OWNER/}
 
     strategy:
       max-parallel: 1
@@ -93,16 +108,23 @@ jobs:
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Checkout deploy repo
-        uses: actions/checkout@v3
+      - name: Checkout deploy team repo
+        uses: actions/checkout@v4
         with:
-          repository: sravni/deploy
+          repository: sravni/deploy_${{ env.TEAM }}
           token: ${{ secrets.TEST_CI_PAT_FOR_ACTIONS }}
           path: deploy
           ref: main
-      
+
+      - name: Login to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.HARBOR_REGISTRY }}
+          username: ${{ secrets.HARBOR_LOGIN }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
       # Если это первая выкладка проекта на dev, то выполняем скрипт helm_create.sh из репы Deploy.
       # Он создаст необходимые файлы, которые в процессе деплоя будем модифицировать.
       - name: Ensure project exist
@@ -159,21 +181,51 @@ jobs:
           "nameOrigin": "${{ matrix.project.project_name }}"}' ${{ env.REPO_PATH }}/_apps/values_dev.yaml
           ; yq e -i '.global.image.tag = "${{ matrix.project.image_version }}" |
           .global.image.repository = "registry.yc.prod.infra.sravni.market/${{ env.TEAM }}_dev/${{ matrix.project.project_name }}" |
-          .global.imagePullSecrets[0] = "harbor-pull-secret" | 
+          .global.imagePullSecrets[0] = "harbor-pull-secret" |
           .Branch = "${{ env.BRANCH }}" |
           .nodeSelector = "'"dev/nodepool: workloads"'" |
           .tolerations = [{"key": "vm", "operator": "Equal", "value": "workloads", "effect": "NoSchedule"}]'
           ${{ env.REPO_PATH }}/${{ matrix.project.project_name }}/values_${{ env.BRANCH }}.yaml;
 
-      - name: Run SAST scan tests
-        run: >
-          curl -X POST -L -F "QDv6UTvo=PQFEGNU35TGOAXCZN"  --insecure "https://10.208.14.120:19445/devops.php?rep=https://github.com/sravni/deploy/blob/main/${{ env.TEAM}}/${{ matrix.project.project_name}}/values_dev.yaml" || curl -X POST -L -F "QDv6UTvo=PQFEGNU35TGOAXCZN"  --insecure "https://158.160.89.149:19445/devops.php?rep=https://github.com/sravni/deploy/blob/main/${{ env.TEAM}}/${{ matrix.project.project_name}}/values_dev.yaml"
-        continue-on-error: true
+      # Если используется репа deploy для команды (например deploy_devops)
+      # то прописываются переменные которые меняют repoURL в argocd application для сервиса
+      - name: Tag application with repoURL
+        run: |
+          if [[ "${{ env.BRANCH }}" != 'master' && "${{ env.BRANCH }}" != 'main' ]];
+          then
+            KEY=$(yq '.services | to_entries | .[] | select(.value.name == "${{ matrix.project.project_name }}-${{ env.BRANCH }}") | .key' ${{ env.REPO_PATH }}/_apps/values_dev.yaml)\
+            && yq -i e ".services[$KEY].repoURL = \"https://github.com/sravni/deploy_${{ env.TEAM }}\", .services[$KEY].branch = \"main\"" ${{ env.REPO_PATH }}/_apps/values_dev.yaml
+          else
+            KEY=$(yq '.services | to_entries | .[] | select(.value.name == "${{ matrix.project.project_name }}") | .key' ${{ env.REPO_PATH }}/_apps/values_dev.yaml)\
+            && yq -i e ".services[$KEY].repoURL = \"https://github.com/sravni/deploy_${{ env.TEAM }}\", .services[$KEY].branch = \"main\"" ${{ env.REPO_PATH }}/_apps/values_dev.yaml
+          fi;
+
+      # Обновляем зависимости чартов
+      - name: Helm dep update
+        working-directory: ${{ env.REPO_PATH }}/${{ matrix.project.project_name }}
+        run: helm dependency update
+
+      # В зависимости от того, публикуемся из мастера или нет проверяем сборку темплейтов
+      - name: Helm check
+        working-directory: ${{ env.REPO_PATH }}/${{ matrix.project.project_name }}
+        run:  |
+          if [[ "${{ env.BRANCH }}" == 'master' ]];
+          then
+          helm template . -f values_dev.yaml;
+          else
+          helm template . -f values_${{ env.BRANCH }}.yaml;
+          fi;
+
+      - name: Helm check cleanup
+        working-directory: ${{ env.REPO_PATH }}/${{ matrix.project.project_name }}
+        run:  |
+          rm -rf charts/ && rm Chart.lock
+      
 
       # Добавляет коммит для поля info в Argo вида
       # commit: sravni/mortgageinsurance/commit/2b13e85a9c5e439b79e406f08a0cde673fa1f4a3
       - name: Adding commit SHA for branch
-        if: ${{ env.BRANCH != 'master' }}
+        if: ${{ env.BRANCH != 'master' && env.BRANCH != 'main' }}
         run: >
           FULL_SHA=${GITHUB_SHA}
           && GIT_REPO=${GITHUB_REPOSITORY}
@@ -181,7 +233,7 @@ jobs:
           && yq -i e ".services[$KEY].commit = \"$GIT_REPO/commit/$FULL_SHA\"" ${{ env.REPO_PATH }}/_apps/values_dev.yaml
 
       - name: Adding commit SHA for master
-        if: ${{ env.BRANCH == 'master' }}
+        if: ${{ env.BRANCH == 'master' || env.BRANCH == 'main' }}
         run: >
           FULL_SHA=${GITHUB_SHA}
           && GIT_REPO=${GITHUB_REPOSITORY}
@@ -193,34 +245,39 @@ jobs:
       - name: Adding create time value
         if: ${{ env.BRANCH != 'master' }}
         run: >
-          if [ "${{ env.DELETE_BRANCHES }}" = true ]; 
-          then 
+          if [ "${{ env.DELETE_BRANCHES }}" = true ];
+          then
           grep -xq '  - name: ${{ matrix.project.project_name }}-${{ env.BRANCH }}' ${{ env.REPO_PATH }}/_apps/values_dev.yaml
           && KEY=$(yq e '.services | to_entries | .[] | select(.value.name == "${{ matrix.project.project_name }}-${{ env.BRANCH }}") | .key' ${{ env.REPO_PATH }}/_apps/values_dev.yaml)
           && CREATE_TIME=$(date +%s)
           && yq e -i '.services.'"$KEY"' += {"createTime": '"$CREATE_TIME"'}' ${{ env.REPO_PATH }}/_apps/values_dev.yaml ;
           fi;
-      
+
       # Запуск скрипта на удаление вэльюсов веток старше 7 дней
       - name: Delete stale branches
         run: |
           bash ./deploy/delete_stale_branches.sh "./deploy/${{ env.TEAM }}/_apps/values_dev.yaml"
-      
+
       - name: Prepare k6 tests
         run: |
-          if [ "${{ env.K6 }}" = true ]; 
+          if [ "${{ env.K6 }}" = true ];
           then
           rm -rf ${{ env.REPO_PATH }}/${{ matrix.project.project_name }}/k6-tests
           cp -r .k6 ${{ env.REPO_PATH }}/${{ matrix.project.project_name }}/k6-tests
           fi;
-      
+
       - name: Do rebase and commit
         run: >
-          cd ./deploy 
+          cd ./deploy
           && git add .
           && git -c user.name="sravnidevops" -c user.email="company-service@sravni.ru" commit --author="${{ github.actor }} <${{ github.actor }}@users.noreply.github.com>" -m "[DEV] ${{ matrix.project.project_name }} new version: ${{ matrix.project.image_version }} / run_id: ${{ github.run_id }}"
           && git -c user.name="sravnidevops" -c user.email="company-service@sravni.ru" pull --rebase
           && git push origin main || sleep 10
           && git -c user.name="sravnidevops" -c user.email="company-service@sravni.ru" pull --rebase
-          && git push origin main 
+          && git push origin main
           && cd ../
+
+      - name: Run SAST Vizhn
+        run: >
+          curl --max-time 60 -X POST -k "${{ env.API_URL_DEPLOY_IN }}?&repo=${{ env.REPO_NAME }}&token=$SCAN_TOKEN" || curl --max-time 60 -X POST -k "${{ env.API_URL_DEPLOY_OUT }}?&repo=${{ env.REPO_NAME }}&token=$SCAN_TOKEN"
+        continue-on-error: true
